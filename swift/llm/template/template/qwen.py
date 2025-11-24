@@ -1966,7 +1966,7 @@ class Qwen2_5OmniTemplate(Qwen2_5VLTemplate):
                 video_audios_mask.append(False)
         # 转换为 tensor，用于后续索引操作
         video_audios_mask = torch.tensor(video_audios_mask)
-        
+
         # 3> 使用 processor 处理所有模态数据
         # processor 会自动识别并处理图像、视频、音频
         media_inputs = processor(
@@ -1980,7 +1980,7 @@ class Qwen2_5OmniTemplate(Qwen2_5VLTemplate):
         # 4> 移除文本相关字段（我们只需要媒体数据）
         media_inputs.pop('input_ids')
         media_inputs.pop('attention_mask')
-        
+
         # 5> 转换媒体数据类型：匹配模型的数据类型（如 float16）
         media_inputs = to_float_dtype(media_inputs, self.model_info.torch_dtype)
         
@@ -1988,7 +1988,7 @@ class Qwen2_5OmniTemplate(Qwen2_5VLTemplate):
         input_ids = encoded['input_ids']  # token IDs 列表
         labels = encoded['labels']  # 标签列表（训练时使用）
         loss_scale = encoded.get('loss_scale', None)  # 损失缩放因子（可选）
-        
+
         # ==================== 步骤7：处理音频 tokens ====================
         # 7.1> 获取音频 token ID：<|AUDIO|> 对应的 token ID
         audio_token_id = self._tokenize('<|AUDIO|>')
@@ -2049,7 +2049,7 @@ class Qwen2_5OmniTemplate(Qwen2_5VLTemplate):
             # 8.1> 获取媒体 token：<|IMAGE|> 或 <|VIDEO|>
             token = f'<|{media_type.upper()}|>'
             token_id = self._tokenize(token)
-            
+
             # 8.2> 查找占位符位置
             idx_list = findall(input_ids, token_id)
             
@@ -2442,7 +2442,7 @@ class Qwen2_5OmniTemplate(Qwen2_5VLTemplate):
         # 从批次中提取所有非空的 input_features
         # 例如：[tensor([[...]]), tensor([[...]]), ...] 列表
         input_features = [b['input_features'] for b in batch if b.get('input_features') is not None]
-        
+
         # 4> 收集音频注意力掩码
         # feature_attention_mask: 音频注意力掩码，shape (time,)
         # 值为 1 的位置表示有效的音频帧，0 表示 padding
@@ -2622,53 +2622,431 @@ class Ovis1_6Template(Template):
         return [[-200], '\n']
 
     def _encode(self, inputs: StdTemplateInputs) -> Dict[str, Any]:
+        """
+        功能：
+            编码输入，动态生成图像 tokens。Ovis 使用特殊的视觉 tokenizer 来处理图像：
+            1> 将图像分区（partition）处理，支持高分辨率图像
+            2> 每个图像生成动态数量的 tokens（取决于图像分辨率和复杂度）
+            3> 将占位符 [-200] 替换为实际的图像 token IDs
+            4> 收集所有图像的像素值用于后续的视觉编码
+            
+            核心特点：
+            - 动态分辨率：不同图像可以有不同数量的 tokens
+            - 分区处理：大图像会被切分为多个 patches（最多 max_partition 个）
+            - 在线处理：token 数量在编码时动态计算，而不是预先确定
+
+        参数：
+            inputs (StdTemplateInputs): 标准模板输入对象，包含：
+                - images: 图像列表（PIL.Image 或路径）
+                - messages: 对话消息列表
+
+        返回：
+            Dict[str, Any]: 编码结果字典，包含：
+                - input_ids: 扩展后的 token IDs 列表（图像占位符已被替换）
+                - labels: 扩展后的标签列表（图像位置为 -100，表示不计算损失）
+                - pixel_values: 图像像素值列表，包含一个张量 shape (total_patches, C, H, W)
+                    - total_patches: 所有图像的总 patch 数
+                    - C: 通道数（3 for RGB）
+                    - H, W: patch 的高度和宽度（如 384×384）
+                - loss_scale: 损失缩放因子（继承自父类，可选）
+
+        示例：
+            >>> # 示例1：单张小图像
+            >>> inputs = StdTemplateInputs(
+            ...     images=['small_image.jpg'],  # 512×512 的图像
+            ...     messages=[{'role': 'user', 'content': '<image>描述图片'}]
+            ... )
+            >>> encoded = template._encode(inputs)
+            >>> # 原始 input_ids: [1, 2, [-200], 3]  (1 个占位符)
+            >>> # 处理后: visual_tokenizer.preprocess_image 返回 16 个 tokens
+            >>> # 扩展后: [1, 2, tok1, tok2, ..., tok16, 3]  (16 个实际 tokens)
+            >>> encoded['pixel_values'][0].shape
+            torch.Size([4, 3, 384, 384])  # 假设图像被分为 4 个 patches
+            
+            >>> # 示例2：多张不同尺寸的图像
+            >>> inputs = StdTemplateInputs(
+            ...     images=['small.jpg', 'large.jpg'],  # 512×512 和 2048×2048
+            ...     messages=[{'role': 'user', 'content': '<image><image>比较这两张图'}]
+            ... )
+            >>> encoded = template._encode(inputs)
+            >>> # 原始 input_ids: [1, [-200], [-200], 2]  (2 个占位符)
+            >>> # 小图生成 4 个 patches（16 tokens），大图生成 9 个 patches（36 tokens）
+            >>> # 扩展后: [1, tok1-16, tok17-52, 2]  (总共 52 个图像 tokens)
+            >>> encoded['pixel_values'][0].shape
+            torch.Size([13, 3, 384, 384])  # 4 + 9 = 13 个 patches
+            
+            >>> # 示例3：无图像输入（纯文本）
+            >>> inputs = StdTemplateInputs(
+            ...     images=[],
+            ...     messages=[{'role': 'user', 'content': '你好'}]
+            ... )
+            >>> encoded = template._encode(inputs)
+            >>> encoded['pixel_values'][0].shape
+            torch.Size([1, 3, 384, 384])  # 虚拟占位图像（全零）
+        """
+        # 1> 调用父类编码方法，获取基础编码结果（文本部分）
         encoded = super()._encode(inputs)
-        images = inputs.images
-        input_ids = encoded['input_ids']
-        labels = encoded['labels']
+
+        # 2> 提取输入数据
+        images = inputs.images  # 图像列表
+        input_ids = encoded['input_ids']  # token IDs 列表
+        labels = encoded['labels']  # 标签列表（训练时使用）
+        
+        # 3> 查找所有图像占位符位置
+        # findall 返回所有 [-200] 在 input_ids 中的索引列表
+        # 例如：input_ids = [1, 2, [-200], 3, [-200], 4]
+        #      idx_list = [2, 4]
         idx_list = findall(input_ids, [-200])
-        added_tokens_len = 0
-        pixel_values = []
+        
+        # 4> 初始化变量
+        added_tokens_len = 0  # 累计添加的 tokens 数量（用于调整后续的索引）
+        pixel_values = []  # 存储所有图像的像素值
+
+        # 5> 遍历每个图像，动态生成 tokens
         for i, idx in enumerate(idx_list):
+            # 6> 获取分区配置：max_partition 控制图像的最大分区数
+            # 默认值 9：表示最多将图像切分为 3×3 的网格
+            # 更大的值允许处理更高分辨率的图像，但会增加计算量
+            # 可通过环境变量 max_partition 覆盖默认值
             max_partition = get_env_args('max_partition', int, 9)
+            
+            # 7> 使用视觉 tokenizer 预处理图像
+            # visual_tokenizer.preprocess_image 会：
+            # - 根据图像尺寸决定分区数量（不超过 max_partition）
+            # - 将图像切分为多个 patches
+            # - 为每个 patch 生成对应的 token IDs
+            # - 返回像素值和 token 占位符列表
+            #
+            # 返回值：
+            # - raw_pixel_values: 图像 patches 的像素值，shape (num_patches, 3, 384, 384)
+            # - image_placeholders: 图像 token IDs 列表，长度 = num_patches * tokens_per_patch
+            #
+            # 示例：512×512 图像 → 2×2 分区 → 4 个 patches → 16 tokens（假设每 patch 4 tokens）
             raw_pixel_values, image_placeholders = self.model.visual_tokenizer.preprocess_image(
                 images[i], max_partition=max_partition)
-            input_ids = input_ids[:idx] + image_placeholders + input_ids[idx + 1:]
+            
+            # 8> 替换占位符为实际的图像 tokens
+            # 由于我们在遍历过程中修改 input_ids，需要调整索引
+            # idx + added_tokens_len: 考虑之前添加的 tokens，计算实际位置
+            # 例如：
+            # - 第 1 次：idx=2, added_tokens_len=0, 实际位置=2
+            # - 第 1 次添加 15 个 tokens（16-1=15）
+            # - 第 2 次：idx=4, added_tokens_len=15, 实际位置=19（原来的位置 4 + 15）
+            actual_idx = idx + added_tokens_len
+            input_ids = input_ids[:actual_idx] + image_placeholders + input_ids[actual_idx + 1:]
+            
+            # 9> 同步更新 labels：图像 tokens 位置设为 -100（不计算损失）
             if labels is not None:
-                labels = labels[:idx] + [-100] * len(image_placeholders) + labels[idx + 1:]
+                # 将图像 tokens 对应的 labels 设为 -100
+                # -100 是 PyTorch 的特殊值，表示在计算交叉熵损失时忽略这些位置
+                labels = labels[:actual_idx] + [-100] * len(image_placeholders) + labels[actual_idx + 1:]
+            
+            # 10> 收集像素值
             pixel_values.append(raw_pixel_values)
+            
+            # 11> 更新累计添加的 tokens 数量
+            # len(image_placeholders) - 1: 因为替换了 1 个占位符，所以净增加数量为 len-1
+            # 例如：占位符 1 个 → 实际 16 个 → 净增加 15 个
             added_tokens_len += len(image_placeholders) - 1
+        
+        # 12> 获取视觉 tokenizer 的数据类型
+        # 确保像素值与模型的数据类型一致（如 float16 或 float32）
         dtype = self.model.visual_tokenizer.dtype
+        
+        # 13> 合并所有图像的像素值
         if pixel_values:
+            # 沿批次维度（dim=0）拼接所有图像的 patches
+            # 例如：
+            # - 图像1: (4, 3, 384, 384)
+            # - 图像2: (9, 3, 384, 384)
+            # - 拼接后: (13, 3, 384, 384)
             pixel_values = torch.cat(pixel_values, dim=0).to(dtype)
         else:
-            pixel_values = torch.zeros((1, 3, 384, 384), dtype=dtype)  # dummpy
+            # 14> 创建虚拟占位图像（无图像输入时）
+            # 使用全零图像作为占位符，避免模型报错
+            # shape: (1, 3, 384, 384)
+            # 注释中的 "dummpy" 应该是 "dummy" 的拼写错误，表示"虚拟的"
+            pixel_values = torch.zeros((1, 3, 384, 384), dtype=dtype)  # dummy placeholder
+        
+        # 15> 更新编码结果：保存扩展后的 tokens 和像素值
         encoded.update({'input_ids': input_ids, 'labels': labels})
+        
+        # 16> 将像素值包装为列表
+        # 使用列表格式是为了与批处理系统兼容（_data_collator 会处理列表）
         encoded['pixel_values'] = [pixel_values]
+        
         return encoded
 
     def _post_encode(self, model, inputs: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        功能：
+            后处理编码结果，融合视觉和文本 embeddings。Ovis 使用特殊的 merge_multimodal 方法：
+            1> 将图像 tokens 通过视觉编码器转换为视觉 embeddings
+            2> 将视觉 embeddings 替换到文本 embeddings 的对应位置
+            3> 处理 padding 和 attention_mask，确保序列对齐
+            4> 返回融合后的 inputs_embeds，供模型前向传播使用
+            
+            核心特点：
+            - 支持动态序列长度：不同图像可以有不同数量的 tokens
+            - 灵活的 padding：训练时右侧 padding，推理时左侧 padding
+            - 统一的多模态接口：通过 merge_multimodal 统一处理视觉和文本
+
+        参数：
+            model: Ovis 模型对象，必须包含 merge_multimodal 方法。
+            inputs (Dict[str, Any]): 编码后的输入字典，包含：
+                - input_ids: token IDs，shape (batch_size, seq_len)
+                - labels: 标签（可选），shape (batch_size, seq_len)
+                - pixel_values: 图像像素值列表，每个元素 shape (num_patches, 3, H, W)
+
+        返回：
+            Dict[str, Any]: 后处理结果字典，包含：
+                - inputs_embeds: 融合后的 embeddings，shape (batch_size, seq_len, hidden_size)
+                    视觉 token 位置已被视觉 embeddings 替换
+                - labels: 处理后的标签，shape (batch_size, seq_len)（训练时）或 None（推理时）
+                - attention_mask: 注意力掩码，shape (batch_size, seq_len)
+                    值为 1 表示有效位置，0 表示 padding
+
+        示例：
+            >>> # 示例1：训练模式（右侧 padding）
+            >>> template.is_training = True
+            >>> template.padding_side = 'right'
+            >>> inputs = {
+            ...     'input_ids': tensor([[1, 2, 100, 101, 102, 3, 4]]),  # 100-102 是图像 tokens
+            ...     'labels': tensor([[1, 2, -100, -100, -100, 3, 4]]),
+            ...     'pixel_values': [tensor([[...]])]  # shape: (3, 3, 384, 384)
+            ... }
+            >>> result = template._post_encode(model, inputs)
+            >>> result['inputs_embeds'].shape
+            torch.Size([1, 7, 4096])  # hidden_size = 4096
+            >>> result['labels']
+            tensor([[1, 2, -100, -100, -100, 3, 4]])  # 图像位置不计算损失
+            >>> result['attention_mask']
+            tensor([[1, 1, 1, 1, 1, 1, 1]])  # 所有位置都有效
+            
+            >>> # 示例2：推理模式（左侧 padding）
+            >>> template.is_training = False
+            >>> inputs = {
+            ...     'input_ids': tensor([[0, 0, 1, 2, 100, 101, 3]]),  # 前 2 个是 padding
+            ...     'pixel_values': [tensor([[...]])]  # shape: (2, 3, 384, 384)
+            ... }
+            >>> result = template._post_encode(model, inputs)
+            >>> result['inputs_embeds'].shape
+            torch.Size([1, 7, 4096])
+            >>> result['labels'] is None
+            True  # 推理时不需要 labels
+            >>> result['attention_mask']
+            tensor([[0, 0, 1, 1, 1, 1, 1]])  # padding 位置为 0
+            
+            >>> # 示例3：批处理（多个样本，不同长度）
+            >>> inputs = {
+            ...     'input_ids': tensor([
+            ...         [1, 2, 100, 101, 3, 0, 0],  # 样本1：5 个有效 tokens + 2 个 padding
+            ...         [1, 2, 100, 101, 102, 103, 3]  # 样本2：7 个有效 tokens
+            ...     ]),
+            ...     'pixel_values': [
+            ...         tensor([[...]]),  # 样本1：2 个 patches
+            ...         tensor([[...]])   # 样本2：4 个 patches
+            ...     ]
+            ... }
+            >>> result = template._post_encode(model, inputs)
+            >>> result['inputs_embeds'].shape
+            torch.Size([2, 7, 4096])  # 批次大小=2
+            >>> result['attention_mask']
+            tensor([
+                [1, 1, 1, 1, 1, 0, 0],  # 样本1：前 5 个有效
+                [1, 1, 1, 1, 1, 1, 1]   # 样本2：全部有效
+            ])
+        """
+        # 1> 确定 padding 方向
+        # 训练时：右侧 padding（标准做法，便于并行处理）
+        # 推理时：左侧 padding（生成任务的常见做法，将提示词放在右侧）
         padding_side = self.padding_side if self.is_training else 'left'
+        
+        # 2> 设置最大序列长度（如果指定）
+        # multimodal_max_length: Ovis 模型的配置参数，控制多模态序列的最大长度
+        # 如果设置了 self.max_length，会覆盖模型的默认配置
         if self.max_length is not None:
             model.config.multimodal_max_length = self.max_length
-        input_ids = inputs['input_ids']
-        labels = inputs.get('labels')
+        
+        # 3> 提取输入数据
+        input_ids = inputs['input_ids']  # shape: (batch_size, seq_len)
+        labels = inputs.get('labels')  # shape: (batch_size, seq_len)（可选）
+        
+        # 4> 创建默认的 labels（如果不存在）
+        # 在推理模式下，通常不会传入 labels
+        # 但 merge_multimodal 需要 labels 参数，所以创建全 -100 的占位符
+        # -100 表示所有位置都不计算损失（相当于忽略）
         if labels is None:
+            # new_full: 创建与 input_ids 相同 shape 的张量，填充值为 -100
+            # 使用 input_ids.new_full 确保设备和数据类型一致
             labels = input_ids.new_full(input_ids.shape, -100)
+        
+        # 5> 调用模型的多模态融合方法
+        # model.merge_multimodal: Ovis 模型的核心方法，执行以下操作：
+        # - 将 pixel_values 通过视觉编码器转换为视觉 embeddings
+        # - 将 input_ids 通过文本 embedding 层转换为文本 embeddings
+        # - 用视觉 embeddings 替换文本 embeddings 中图像 token 的位置
+        # - 根据 left_padding 调整序列对齐方式
+        # - 处理 attention_mask 和 labels
+        #
+        # 参数：
+        # - text_input_ids: 文本 token IDs
+        # - text_attention_masks: 文本注意力掩码（这里传全 1，表示都有效）
+        #   注释说明 "not use, only compat"：实际不使用，只是为了兼容接口
+        #   真正的 attention_mask 由 merge_multimodal 内部计算
+        # - text_labels: 文本标签
+        # - pixel_values: 图像像素值列表
+        # - left_padding: 是否使用左侧 padding
+        #
+        # 返回值：(tuple with 4 elements)
+        # - 第 1 个：合并后的 input_ids（通常不使用，我们用 inputs_embeds）
+        # - 第 2 个：inputs_embeds - 融合后的 embeddings
+        # - 第 3 个：labels - 处理后的标签
+        # - 第 4 个：attention_mask - 注意力掩码
         _, inputs_embeds, labels, attention_mask = model.merge_multimodal(
             text_input_ids=input_ids,
-            text_attention_masks=torch.ones_like(input_ids),  # not use, only compat
+            text_attention_masks=torch.ones_like(input_ids),  # 全 1 掩码（仅用于兼容）
             text_labels=labels,
             pixel_values=inputs['pixel_values'],
             left_padding=padding_side == 'left')
+        
+        # 6> 处理推理模式的 labels
+        # 如果原始输入中没有 labels，则将其设为 None
+        # 这确保在推理时不会意外使用虚拟的 labels
         if inputs.get('labels') is None:
             labels = None
+        
+        # 7> 返回融合后的结果
+        # 注意：不再返回 input_ids，而是返回 inputs_embeds
+        # 模型会直接使用 inputs_embeds 进行前向传播，跳过 embedding 层
         return {'inputs_embeds': inputs_embeds, 'labels': labels, 'attention_mask': attention_mask}
 
     def _data_collator(self, batch: List[Dict[str, Any]], *, padding_to: Optional[int] = None) -> Dict[str, Any]:
+        """
+        功能：
+            批处理数据整理器，收集批次中的样本并进行 padding 对齐。Ovis 的数据整理器需要：
+            1> 收集所有样本的 pixel_values（保持列表格式，不拼接）
+            2> 调用父类方法处理文本部分（input_ids、labels 等的 padding）
+            3> 将 pixel_values 添加到结果字典
+            
+            核心特点：
+            - pixel_values 保持列表格式：每个样本的图像数据独立存储
+            - 不进行视觉数据的 padding：图像已经预处理为固定大小的 patches
+            - 文本部分由父类处理：自动对齐到批次中的最大长度
+
+        参数：
+            batch (List[Dict[str, Any]]): 批次样本列表，每个样本是一个字典，包含：
+                - input_ids: token IDs 列表
+                - labels: 标签列表（可选）
+                - pixel_values: 图像像素值列表，格式为 [tensor(num_patches, 3, H, W)]
+                - loss_scale: 损失缩放因子（可选）
+            padding_to (Optional[int]): 填充到的目标长度（可选）
+                - None: 自动 padding 到批次中的最大长度
+                - int: 强制 padding 到指定长度
+
+        返回：
+            Dict[str, Any]: 批次级别的数据字典，包含：
+                - input_ids: 批次 token IDs，shape (batch_size, max_seq_len)
+                - attention_mask: 注意力掩码，shape (batch_size, max_seq_len)
+                - labels: 批次标签，shape (batch_size, max_seq_len)（训练时）
+                - pixel_values: 图像像素值列表，长度为 batch_size
+                    每个元素 shape: (num_patches_i, 3, H, W)
+                - loss_scale: 损失缩放列表（如果存在）
+
+        示例：
+            >>> # 示例1：简单批次（2 个样本，相同长度）
+            >>> batch = [
+            ...     {
+            ...         'input_ids': [1, 2, 100, 101, 3],
+            ...         'labels': [1, 2, -100, -100, 3],
+            ...         'pixel_values': [tensor([[...]])]  # shape: (2, 3, 384, 384)
+            ...     },
+            ...     {
+            ...         'input_ids': [1, 2, 100, 101, 3],
+            ...         'labels': [1, 2, -100, -100, 3],
+            ...         'pixel_values': [tensor([[...]])]  # shape: (2, 3, 384, 384)
+            ...     }
+            ... ]
+            >>> result = template._data_collator(batch)
+            >>> result['input_ids'].shape
+            torch.Size([2, 5])  # 2 个样本，每个 5 个 tokens
+            >>> len(result['pixel_values'])
+            2  # 列表，每个样本一个元素
+            >>> result['pixel_values'][0].shape
+            torch.Size([2, 3, 384, 384])  # 第 1 个样本的 2 个 patches
+            
+            >>> # 示例2：不同长度的样本（需要 padding）
+            >>> batch = [
+            ...     {
+            ...         'input_ids': [1, 2, 100, 3],  # 长度 4
+            ...         'labels': [1, 2, -100, 3],
+            ...         'pixel_values': [tensor([[...]])]  # shape: (1, 3, 384, 384)
+            ...     },
+            ...     {
+            ...         'input_ids': [1, 2, 100, 101, 102, 3],  # 长度 6
+            ...         'labels': [1, 2, -100, -100, -100, 3],
+            ...         'pixel_values': [tensor([[...]])]  # shape: (3, 3, 384, 384)
+            ...     }
+            ... ]
+            >>> result = template._data_collator(batch)
+            >>> result['input_ids'].shape
+            torch.Size([2, 6])  # padding 到最大长度 6
+            >>> result['input_ids']
+            tensor([
+                [1, 2, 100, 3, 0, 0],      # 第 1 个样本 padding 了 2 个 0
+                [1, 2, 100, 101, 102, 3]   # 第 2 个样本无需 padding
+            ])
+            >>> result['attention_mask']
+            tensor([
+                [1, 1, 1, 1, 0, 0],  # 前 4 个有效
+                [1, 1, 1, 1, 1, 1]   # 全部有效
+            ])
+            >>> len(result['pixel_values'])
+            2
+            >>> result['pixel_values'][0].shape
+            torch.Size([1, 3, 384, 384])  # 第 1 个样本：1 个 patch
+            >>> result['pixel_values'][1].shape
+            torch.Size([3, 3, 384, 384])  # 第 2 个样本：3 个 patches
+            
+            >>> # 示例3：指定 padding 长度
+            >>> batch = [
+            ...     {'input_ids': [1, 2, 3], 'pixel_values': [tensor([[...]])]},
+            ...     {'input_ids': [1, 2, 3, 4], 'pixel_values': [tensor([[...]])]}
+            ... ]
+            >>> result = template._data_collator(batch, padding_to=10)
+            >>> result['input_ids'].shape
+            torch.Size([2, 10])  # 强制 padding 到长度 10
+            >>> result['attention_mask']
+            tensor([
+                [1, 1, 1, 0, 0, 0, 0, 0, 0, 0],  # 前 3 个有效
+                [1, 1, 1, 1, 0, 0, 0, 0, 0, 0]   # 前 4 个有效
+            ])
+        """
+        # 1> 收集所有样本的 pixel_values
+        # gather_list: 从批次中提取所有非空的 pixel_values
+        # 返回：列表，长度为 batch_size
+        # 例如：[tensor([[...]]), tensor([[...]]), ...]
+        #
+        # 为什么保持列表格式？
+        # - 每个样本的图像数量和 patch 数量可能不同
+        # - 不需要拼接，因为 merge_multimodal 会独立处理每个样本的图像
+        # - 避免不必要的 padding（图像数据量大，padding 会浪费内存）
         pixel_values = self.gather_list(batch, 'pixel_values')
+        
+        # 2> 调用父类方法，处理文本部分（input_ids、labels 等）
+        # 父类会执行以下操作：
+        # - 将所有样本的 input_ids 转换为张量
+        # - padding 到批次中的最大长度（或 padding_to 指定的长度）
+        # - 生成 attention_mask（1 表示有效位置，0 表示 padding）
+        # - padding labels（使用 -100 填充）
+        # - 收集其他字段（如 loss_scale）
         res = super()._data_collator(batch, padding_to=padding_to)
+        
+        # 3> 添加 pixel_values 到结果字典
+        # 注意：pixel_values 保持列表格式，不进行张量拼接
         res['pixel_values'] = pixel_values
+        
+        # 4> 返回完整的批次数据
         return res
 
 
