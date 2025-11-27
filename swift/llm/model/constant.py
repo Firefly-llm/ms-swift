@@ -1,5 +1,7 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
 # Classification criteria for model_type: same model architecture, tokenizer (get function), template.
+# itertools 是Python标准库中的一个模块，提供了一些用于操作迭代对象的函数。
+# chain是itertools模块中的一个函数，用于将多个迭代对象连接成一个迭代对象。
 from itertools import chain
 from typing import List
 
